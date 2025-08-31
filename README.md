@@ -45,7 +45,7 @@ An AI-powered application that automatically processes and analyzes financial do
    ```
 
 5. **Install Tesseract OCR**
-   - **Windows**: Download from [GitHub](https://github.com/UB-Mannheim/tesseract/wiki)
+   - **Windows**: Download from [GitHub]
    - **macOS**: `brew install tesseract`
    - **Linux**: `sudo apt-get install tesseract-ocr`
 
