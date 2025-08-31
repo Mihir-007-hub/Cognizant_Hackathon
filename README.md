@@ -1,4 +1,4 @@
-# 🏦 Intelligent Loan Document Processor
+# 🏦 Intelligent Loan Document Processor - Cognizant Hackathon
 
 An AI-powered application that automatically processes and analyzes financial documents for loan applications using Google Gemini AI and LangChain.
 
@@ -23,8 +23,8 @@ An AI-powered application that automatically processes and analyzes financial do
 
 1. **Clone the repository**
    ```bash
-   git clone <your-repo-url>
-   cd loan_processor
+   git clone https://github.com/AtharvaKsh25/Cognizant_Hackathon.git
+   cd Cognizant_Hackathon
    ```
 
 2. **Create virtual environment**
@@ -137,3 +137,4 @@ If you encounter any issues:
 - [ ] Export to various formats
 - [ ] Integration with loan management systems
 - [ ] Advanced fraud detection
+
