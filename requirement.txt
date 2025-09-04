@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-python-multipart
-aiofiles
-google-generativeai
-google-cloud-vision
-python-dotenv

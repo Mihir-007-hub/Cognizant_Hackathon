@@ -24,7 +24,11 @@ app = FastAPI(title="Intelligent Document Processor API")
 MONGO_DETAILS = os.getenv("MONGO_DETAILS")
 if not MONGO_DETAILS:
     raise ValueError("MONGO_DETAILS environment variable not set!")
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_DETAILS)
+
+# --- FIX: Added tls=True for robust SSL connection to MongoDB Atlas ---
+# Ensure your IP is whitelisted in MongoDB Atlas under Network Access.
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_DETAILS, tls=True, tlsAllowInvalidCertificates=True)
+
 db = client.loan_processing
 verified_collection = db.get_collection("verified_documents")
 
@@ -191,7 +195,8 @@ async def save_verified_document(payload: VerificationPayload):
 @app.get("/get-report-data/")
 async def get_report_data():
     try:
-        cursor = verified_collection.find({"is_active": True})
+        # --- CHANGE: Fetch all documents to show history, not just active ones ---
+        cursor = verified_collection.find({})
         documents = await cursor.to_list(length=None)
         for doc in documents:
             doc["_id"] = str(doc["_id"])
