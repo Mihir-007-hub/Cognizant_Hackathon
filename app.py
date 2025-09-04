@@ -4,7 +4,7 @@ import json
 import pandas as pd
 import re
 import os
-import numpy as np
+import uuid
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -58,7 +58,8 @@ page = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.info("This project leverages Generative AI to automate loan document processing, including a human-in-the-loop verification workflow.")
 
-def display_verification_form(doc_data, unique_key):
+# --- Helper function for the verification form ---
+def display_verification_form(doc_data, application_id, unique_key):
     extracted_data = doc_data.get("extracted_data", {})
     filename = doc_data.get("filename", "unknown_file")
     
@@ -88,16 +89,18 @@ def display_verification_form(doc_data, unique_key):
         if submitted:
             with st.spinner("Saving verified data..."):
                 payload = {
+                    "application_id": application_id,
                     "filename": filename,
                     "original_ai_data": doc_data,
                     "verified_data": corrected_data
                 }
                 try:
-                    save_response = requests.post("http://127.0.0.1:8000/save-data/", json=payload)
+                    # Calls the correct MongoDB endpoint
+                    save_response = requests.post("http://127.0.0.1:8000/save-verified-document/", json=payload)
                     if save_response.status_code == 200:
                         st.success(f"✅ Verified data for `{filename}` saved successfully!")
                     else:
-                        st.error(f"Failed to save data for `{filename}`.")
+                        st.error(f"Failed to save data for `{filename}`: {save_response.text}")
                 except requests.exceptions.ConnectionError:
                     st.error("🚫 Connection Error: Could not connect to the backend to save data.")
 
@@ -114,15 +117,22 @@ if page == "Loan Application Processor":
     )
     st.markdown("---")
 
-    st.subheader("📁 Upload Loan Application Package")
-    uploaded_files = st.file_uploader(
-        "Drag & Drop all documents here or Click to Browse",
-        type=["pdf", "png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        help="You can select multiple files at once."
-    )
+    st.header("📁 Upload Loan Application Package")
+    col1_upload, col2_upload, col3_upload = st.columns(3)
+    with col1_upload:
+        st.subheader("1. KYC Documents")
+        kyc_files = st.file_uploader("Upload PAN, Aadhaar, etc.", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="kyc_uploader")
+    with col2_upload:
+        st.subheader("2. Bank Statements")
+        bank_files = st.file_uploader("Upload latest 6-month statements.", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="bank_uploader")
+    with col3_upload:
+        st.subheader("3. Income Proof")
+        income_files = st.file_uploader("Upload Payslips, Form 16, ITR.", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key="income_uploader")
+
+    uploaded_files = kyc_files + bank_files + income_files
 
     if uploaded_files:
+        st.markdown("---")
         if st.button("Process Full Application", type="primary"):
             st.info(f"✨ Processing {len(uploaded_files)} documents...")
             with st.spinner('AI is analyzing the application... This may take some time.'):
@@ -145,6 +155,7 @@ if page == "Loan Application Processor":
 
     if "application_results" in st.session_state and st.session_state.application_results:
         results = st.session_state.application_results
+        application_id = results.get("application_id")
         
         st.markdown("---")
         st.header("🏁 Final Underwriting Summary Report")
@@ -181,6 +192,10 @@ if page == "Loan Application Processor":
                     st.write(f"- 🚩 {flag}")
             else:
                 st.write("None identified.")
+
+        with st.expander("View Initial Cross-Validation Check"):
+            cross_val_report = results.get('cross_validation_report', {})
+            st.json(cross_val_report)
         
         st.markdown("---")
         st.subheader("📄 Individual Document Verification")
@@ -193,7 +208,7 @@ if page == "Loan Application Processor":
             with st.expander(f"**{doc_type}**: `{filename}`"):
                 col1_doc, col2_doc = st.columns(2)
                 with col1_doc:
-                    display_verification_form(doc_result, unique_key=f"doc_{i}")
+                    display_verification_form(doc_result, application_id, unique_key=f"doc_{i}")
                 with col2_doc:
                     st.markdown("##### AI Analysis")
                     analysis = doc_result.get('analysis', {})
@@ -202,62 +217,79 @@ if page == "Loan Application Processor":
                     else:
                         st.write("No analysis provided.")
 
-                # --- THE FIX: Add an expander for the full raw data of THIS document ---
                 with st.expander("View Full Raw Data (for debugging)"):
-                    st.json(doc_result) # Display the whole dictionary for the document
+                    st.json(doc_result)
 
 
-# --- Page 2: Reporting Dashboard ---
+# --- Page 2: Reporting Dashboard (Refactored for MongoDB) ---
 elif page == "Reporting Dashboard":
     st.title("📊 Reporting Dashboard")
     st.markdown("---")
-    data_file_path = "verified_data.csv"
 
-    if os.path.exists(data_file_path):
-        try:
-            df = pd.read_csv(data_file_path)
-            st.subheader("Key Performance Indicators")
-            total_fields, matching_fields = 0, 0
-            fields_to_check = [col.replace('verified_', '') for col in df.columns if col.startswith('verified_')]
-            for field in fields_to_check:
-                ai_col, verified_col = f"ai_{field}", f"verified_{field}"
-                if ai_col in df.columns and verified_col in df.columns:
-                    df[ai_col] = df[ai_col].fillna('N/A').astype(str).str.strip()
-                    df[verified_col] = df[verified_col].fillna('N/A').astype(str).str.strip()
-                    comparison = df[ai_col] == df[verified_col]
-                    matching_fields += comparison.sum()
-                    total_fields += len(df)
-            ai_accuracy = (matching_fields / total_fields) * 100 if total_fields > 0 else 0
-            total_docs = len(df)
-            avg_income = pd.to_numeric(df.get('verified_gross_income'), errors='coerce').mean()
-            avg_taxes = pd.to_numeric(df.get('verified_total_taxes'), errors='coerce').mean()
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Total Docs Processed", f"{total_docs}")
-            col2.metric("Avg. Gross Income", f"₹{avg_income:,.2f}" if not pd.isna(avg_income) else "N/A")
-            col3.metric("Avg. Total Taxes", f"₹{avg_taxes:,.2f}" if not pd.isna(avg_taxes) else "N/A")
-            col4.metric("AI Accuracy", f"{ai_accuracy:.2f}%")
-            st.markdown("---")
-            st.subheader("Verified Data Overview (AI vs. Human)")
-            st.dataframe(df)
+    try:
+        # Fetches data from the new MongoDB endpoint
+        response = requests.get("http://127.0.0.1:8000/get-report-data/")
+        if response.status_code == 200:
+            data = response.json()
+            if data:
+                records = []
+                for item in data:
+                    flat_record = {"application_id": item["application_id"], "filename": item["filename"]}
+                    for key, val in item.get("ai_data", {}).items():
+                        flat_record[f"ai_{key.replace(' ', '_').lower()}"] = val.get("value") if isinstance(val, dict) else val
+                    for key, val in item.get("verified_data", {}).items():
+                        flat_record[f"verified_{key.replace(' ', '_').lower()}"] = val
+                    records.append(flat_record)
+                
+                df = pd.DataFrame(records)
+                
+                st.subheader("Key Performance Indicators")
+                total_fields, matching_fields = 0, 0
+                fields_to_check = [col.replace('verified_', '') for col in df.columns if col.startswith('verified_')]
+                for field in fields_to_check:
+                    ai_col, verified_col = f"ai_{field}", f"verified_{field}"
+                    if ai_col in df.columns and verified_col in df.columns:
+                        df[ai_col] = df[ai_col].fillna('').astype(str)
+                        df[verified_col] = df[verified_col].fillna('').astype(str)
+                        comparison = df[ai_col] == df[verified_col]
+                        matching_fields += comparison.sum()
+                        total_fields += len(df)
+                
+                ai_accuracy = (matching_fields / total_fields) * 100 if total_fields > 0 else 0
+                total_docs = len(df)
+                avg_income = pd.to_numeric(df.get('verified_gross_income'), errors='coerce').mean()
+                avg_taxes = pd.to_numeric(df.get('verified_total_taxes'), errors='coerce').mean()
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Docs Verified", f"{total_docs}")
+                col2.metric("Avg. Gross Income", f"₹{avg_income:,.2f}" if not pd.isna(avg_income) else "N/A")
+                col3.metric("Avg. Total Taxes", f"₹{avg_taxes:,.2f}" if not pd.isna(avg_taxes) else "N/A")
+                col4.metric("AI Accuracy", f"{ai_accuracy:.2f}%")
 
-            st.markdown("---")
-            st.subheader("Manage Data")
-            if st.checkbox("I want to permanently delete all verified data."):
-                if st.button("Delete All Data", type="primary", help="This action cannot be undone."):
-                    try:
-                        delete_response = requests.delete("http://127.0.0.1:8000/delete-data/")
-                        if delete_response.status_code == 200:
-                            st.success("All verified data has been deleted successfully.")
-                            st.rerun()
-                        else:
-                            st.error(f"Failed to delete data: {delete_response.text}")
-                    except requests.exceptions.ConnectionError:
-                        st.error("🚫 Connection Error: Could not connect to the backend.")
-        except pd.errors.ParserError:
-            st.error("Error reading the data file. It may be corrupted. Please use the 'Delete All Data' button to reset it.")
-        except Exception as e:
-            st.error(f"An unexpected error occurred while loading the dashboard: {e}")
+                st.markdown("---")
+                st.subheader("Verified Data Summary")
+                st.dataframe(df)
 
-    else:
-        st.warning("No verified data found. Process and approve a document first.")
+                st.markdown("---")
+                st.subheader("Manage Data")
+                if st.checkbox("I want to permanently delete all verified data."):
+                    if st.button("Delete All Data", type="primary", help="This action cannot be undone."):
+                        try:
+                            # Calls the correct delete endpoint
+                            delete_response = requests.delete("http://127.0.0.1:8000/delete-all-data/")
+                            if delete_response.status_code == 200:
+                                st.success("All verified data has been deleted successfully.")
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to delete data: {delete_response.text}")
+                        except requests.exceptions.ConnectionError:
+                            st.error("🚫 Connection Error.")
+            else:
+                st.warning("No verified data found in the database.")
+        else:
+            st.error("Failed to fetch report data from the backend.")
+    except requests.exceptions.ConnectionError:
+        st.error("🚫 Connection Error: Could not connect to the backend.")
+    except Exception as e:
+        st.error(f"An unexpected error occurred while loading the dashboard: {e}")
 

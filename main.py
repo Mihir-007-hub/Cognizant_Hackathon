@@ -2,8 +2,9 @@ import os
 import io
 import json
 import base64
-import csv
 import re
+import uuid
+from datetime import datetime, timezone
 from pydantic import BaseModel
 from typing import Dict, Any, List
 from PIL import Image
@@ -12,13 +13,24 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from dotenv import load_dotenv
 from pdf2image import convert_from_bytes
+# --- NEW: MongoDB Dependencies ---
+import motor.motor_asyncio
+from bson import ObjectId
 
 load_dotenv()
 app = FastAPI(title="Intelligent Document Processor API")
 
+# --- NEW: MongoDB Connection ---
+MONGO_DETAILS = os.getenv("MONGO_DETAILS")
+if not MONGO_DETAILS:
+    raise ValueError("MONGO_DETAILS environment variable not set!")
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_DETAILS)
+db = client.loan_processing
+verified_collection = db.get_collection("verified_documents")
+
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0)
 
-# Using the full set of prompts from your version
+# --- Prompts are preserved ---
 unified_prompt = """
 You are an expert AI assistant for a loan processing bank. Your task is to analyze the provided document image and perform two steps:
 1.  **Classify the document.** Your first response in the JSON should be the 'document_type'. Choose from: 'Payslip', 'Tax Form', 'PAN Card', 'Identity Card', or 'Other'.
@@ -35,6 +47,7 @@ Follow these strict rules:
 - The final output must be ONLY the JSON object, with no extra text or markdown.
 """
 
+# --- RESTORED: Cross-Validation Prompt ---
 cross_validation_prompt = """
 You are a senior loan underwriter AI. You have been provided with extracted data from multiple documents for a single loan application.
 Your task is to perform a final cross-validation check. Analyze all the data and identify any critical inconsistencies between the documents.
@@ -62,6 +75,7 @@ Here is all the data:
 Provide your response as a single, valid JSON object with four keys: "overall_summary", "key_financial_metrics", "consolidated_red_flags", and "final_recommendation".
 The final output must be ONLY the JSON object.
 """
+
 
 def pil_to_base64(image):
     buffered = io.BytesIO()
@@ -100,6 +114,7 @@ async def process_single_file(file_content: bytes, filename: str) -> dict:
 @app.post("/process-application/")
 async def process_application(files: List[UploadFile] = File(...)):
     try:
+        application_id = str(uuid.uuid4()) # Generate a unique ID for this application batch
         application_results = []
         for file in files:
             file_content = await file.read()
@@ -114,33 +129,28 @@ async def process_application(files: List[UploadFile] = File(...)):
         
         try:
             json_match = re.search(r'\{.*\}', cross_val_response_str, re.DOTALL)
-            if json_match:
-                cross_val_json = json.loads(json_match.group(0))
-            else:
-                raise json.JSONDecodeError("No JSON object found")
+            cross_val_json = json.loads(json_match.group(0)) if json_match else {}
         except json.JSONDecodeError:
             cross_val_json = {"overall_summary": "AI cross-validation returned an invalid format.", "validation_passed": False}
 
         # --- RESTORED: Final Summary Report Step ---
-        complete_data_for_summary = {
+        complete_data_for_summary = { 
             "individual_documents": application_results,
-            "initial_cross_validation": cross_val_json # Pass the result to the final step
+            "initial_cross_validation": cross_val_json
         }
         summary_message = HumanMessage(content=final_summary_prompt.format(complete_data=json.dumps(complete_data_for_summary, indent=2)))
         summary_response_str = llm.invoke([summary_message]).content
 
         try:
             json_match = re.search(r'\{.*\}', summary_response_str, re.DOTALL)
-            if json_match:
-                summary_json = json.loads(json_match.group(0))
-            else:
-                raise json.JSONDecodeError("No JSON object found")
+            summary_json = json.loads(json_match.group(0)) if json_match else {}
         except json.JSONDecodeError:
             summary_json = {"final_recommendation": "Error", "overall_summary": "AI failed to generate a final summary report."}
 
         return {
+            "application_id": application_id,
             "individual_document_results": application_results,
-            "cross_validation_report": cross_val_json, # Now included in the response
+            "cross_validation_report": cross_val_json,
             "final_summary_report": summary_json
         }
     except Exception as e:
@@ -148,56 +158,52 @@ async def process_application(files: List[UploadFile] = File(...)):
             raise e
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during application processing: {str(e)}")
 
+
 class VerificationPayload(BaseModel):
+    application_id: str
     filename: str
     original_ai_data: Dict[str, Any]
     verified_data: Dict[str, str]
 
-ALL_POSSIBLE_FIELDS = [
-    'applicant_name', 'gross_income', 'net_pay', 'total_taxes', 'pay_period_end_date',
-    'total_income', 'taxes_paid', 'assessment_year',
-    'name', 'father_s_name', 'date_of_birth', 'pan_number', 'address'
-]
-CSV_HEADERS = ['original_filename'] + [f'ai_{f}' for f in ALL_POSSIBLE_FIELDS] + [f'verified_{f}' for f in ALL_POSSIBLE_FIELDS]
-
-@app.post("/save-data/")
-async def save_data(payload: VerificationPayload):
-    save_path = "verified_data.csv"
-    flat_data = {'original_filename': payload.filename}
-    extracted_data = payload.original_ai_data.get("extracted_data", {})
-    for key, value_dict in extracted_data.items():
-        normalized_key = key.replace(' ', '_').lower()
-        if isinstance(value_dict, dict):
-            col_name = f"ai_{normalized_key}"
-            if col_name in CSV_HEADERS:
-                flat_data[col_name] = value_dict.get('value')
-
-    for key, value in payload.verified_data.items():
-        normalized_key = key.replace(' ', '_').lower()
-        col_name = f"verified_{normalized_key}"
-        if col_name in CSV_HEADERS:
-            flat_data[col_name] = value
-    
+@app.post("/save-verified-document/")
+async def save_verified_document(payload: VerificationPayload):
     try:
-        file_exists = os.path.isfile(save_path)
-        with open(save_path, mode='a', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=CSV_HEADERS)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(flat_data)
-        return {"status": "success", "message": f"Data saved to {save_path}"}
+        await verified_collection.update_many(
+            {"application_id": payload.application_id, "filename": payload.filename, "is_active": True},
+            {"$set": {"is_active": False, "end_date": datetime.now(timezone.utc)}}
+        )
+        
+        new_document_record = {
+            "application_id": payload.application_id,
+            "filename": payload.filename,
+            "ai_data": payload.original_ai_data.get("extracted_data", {}),
+            "verified_data": payload.verified_data,
+            "start_date": datetime.now(timezone.utc),
+            "end_date": None,
+            "is_active": True
+        }
+        
+        result = await verified_collection.insert_one(new_document_record)
+        return {"status": "success", "message": f"Verified data for {payload.filename} saved with ID {result.inserted_id}."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save data to MongoDB: {str(e)}")
 
-@app.delete("/delete-data/")
-async def delete_data():
-    save_path = "verified_data.csv"
+@app.get("/get-report-data/")
+async def get_report_data():
     try:
-        if os.path.exists(save_path):
-            os.remove(save_path)
-            return {"status": "success", "message": "All verified data has been deleted."}
-        else:
-            return {"status": "not_found", "message": "No data file found to delete."}
+        cursor = verified_collection.find({"is_active": True})
+        documents = await cursor.to_list(length=None)
+        for doc in documents:
+            doc["_id"] = str(doc["_id"])
+        return documents
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch report data: {str(e)}")
+
+@app.delete("/delete-all-data/")
+async def delete_all_data():
+    try:
+        await verified_collection.delete_many({})
+        return {"status": "success", "message": "All verified data has been deleted from the database."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete data: {str(e)}")
 
