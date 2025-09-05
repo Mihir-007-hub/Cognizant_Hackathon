@@ -325,5 +325,3 @@ elif page == "Reporting Dashboard":
         st.error("🚫 Connection Error: Could not connect to the backend.")
     except Exception as e:
         st.error(f"An unexpected error occurred while loading the dashboard: {e}")
-
-
