@@ -25,33 +25,56 @@ MONGO_DETAILS = os.getenv("MONGO_DETAILS")
 if not MONGO_DETAILS:
     raise ValueError("MONGO_DETAILS environment variable not set!")
 
-# --- FIX: Added tls=True for robust SSL connection to MongoDB Atlas ---
-# Ensure your IP is whitelisted in MongoDB Atlas under Network Access.
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_DETAILS, tls=True, tlsAllowInvalidCertificates=True)
+client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_DETAILS)
 
 db = client.loan_processing
 verified_collection = db.get_collection("verified_documents")
 
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0)
 
-# --- Prompts are preserved ---
-unified_prompt = """
-You are an expert AI assistant for a loan processing bank. Your task is to analyze the provided document image and perform two steps:
-1.  **Classify the document.** Your first response in the JSON should be the 'document_type'. Choose from: 'Payslip', 'Tax Form', 'PAN Card', 'Identity Card', or 'Other'.
-2.  **Extract key information based on the type you identified.** For each field, provide the 'value' and a 'confidence' score.
-    - If it is a 'Payslip', extract: "Applicant Name", "Gross Income", "Net Pay", "Total Taxes", "Pay Period End Date".
-    - If it is a 'Tax Form', extract: "Applicant Name", "Total Income", "Taxes Paid", "Assessment Year".
-    - If it is a 'PAN Card', extract: "Name", "Father's Name", "Date of Birth", "PAN Number".
-    - If it is an 'Identity Card', extract: "Name", "Date of Birth", "Address".
-    - If 'Other', extract any PII and key financial figures.
-3.  **Provide an analysis.** This MUST be a JSON object with two keys: "red_flags" (a list of strings) and "inconsistencies" (a list of strings). If there are none, return empty lists.
-Follow these strict rules:
-- Return numbers as floats, with NO currency symbols or commas.
-- Provide your response as a single, valid JSON object with three top-level keys: "document_type", "extracted_data", and "analysis".
-- The final output must be ONLY the JSON object, with no extra text or markdown.
+# --- PROMPT ENGINEERING UPGRADE ---
+
+# 1. More specific classification options
+classification_prompt_template = """
+You are an expert document classifier. Your task is to analyze the provided document image and identify its type.
+Respond with only one of the following categories: 'Payslip', 'Tax Form', 'PAN Card', 'Aadhaar Card', 'Driving License', 'Bank Statement', 'Form 16', 'ITR', or 'Other'.
+Do not add any other text or explanation.
 """
 
-# --- RESTORED: Cross-Validation Prompt ---
+# 2. More detailed extraction prompts for each document type
+extraction_prompts = {
+    "Payslip": """
+    You are an expert AI assistant. From the provided payslip image, extract: "Applicant Name", "Gross Income", "Net Pay", "Total Taxes", and "Pay Period End Date".
+    For each field, provide the 'value' and a 'confidence' score.
+    Provide your response as a single, valid JSON object with keys "extracted_data" and "analysis".
+    """,
+    "Tax Form": """
+    You are an expert AI assistant. From the provided tax form image, extract: "Applicant Name", "Total Income", "Taxes Paid", and "Assessment Year".
+    For each field, provide the 'value' and a 'confidence' score.
+    Provide your response as a single, valid JSON object with keys "extracted_data" and "analysis".
+    """,
+    "PAN Card": """
+    You are an expert AI assistant. From the provided PAN Card image, extract: "Name", "Father's Name", "Date of Birth", and "PAN Number".
+    For each field, provide the 'value' and a 'confidence' score.
+    Provide your response as a single, valid JSON object with keys "extracted_data" and "analysis".
+    """,
+    "Aadhaar Card": """
+    You are an expert AI assistant. From the provided Aadhaar Card image, extract: "Name", "Date of Birth", "Address", "Gender", and "Aadhaar Number" (the 12-digit number).
+    For each field, provide the 'value' and a 'confidence' score.
+    Provide your response as a single, valid JSON object with keys "extracted_data" and "analysis".
+    """,
+    "Driving License": """
+    You are an expert AI assistant. From the provided Driving License image, extract: "Name", "Date of Birth", "Address", and "DL No" (the license number).
+    For each field, provide the 'value' and a 'confidence' score.
+    Provide your response as a single, valid JSON object with keys "extracted_data" and "analysis".
+    """,
+    "Default": """
+    You are an expert AI assistant. From the provided document image, extract any personally identifiable information (PII) and key financial figures you can find.
+    For each field, provide the 'value' and a 'confidence' score.
+    Provide your response as a single, valid JSON object with keys "extracted_data" and "analysis".
+    """
+}
+
 cross_validation_prompt = """
 You are a senior loan underwriter AI. You have been provided with extracted data from multiple documents for a single loan application.
 Your task is to perform a final cross-validation check. Analyze all the data and identify any critical inconsistencies between the documents.
@@ -64,18 +87,22 @@ Provide a summary of your findings as a single, valid JSON object with two keys:
 The final output must be ONLY the JSON object, with no extra text or markdown.
 """
 
+# 3. A more robust and clearer final summary prompt
 final_summary_prompt = """
-You are the lead AI underwriter. You have been given the complete data extracted from a loan application package, including individual document analyses and an initial cross-validation report.
-Your task is to generate a final, comprehensive summary report for the human loan officer.
-Based on all the information provided below, generate a report that includes:
-1.  **Overall Summary:** A brief, two-sentence summary of the applicant's financial profile.
-2.  **Key Financial Metrics:** This MUST be a list of strings, with each string formatted as "Metric Name: Value".
-3.  **Consolidated Red Flags:** Combine all red flags and inconsistencies from all documents into a single, clear list of strings.
-4.  **Final Recommendation:** Provide a final recommendation from these options: 'Approve', 'Deny', or 'Manual Review Required'.
+You are the lead AI underwriter. You have been given the complete data extracted from a loan application package.
+Your task is to generate a final, comprehensive summary report.
+
+Based on all the information provided below:
+1.  **Write a concise, two-sentence overall summary** of the applicant's financial profile and the quality of their documentation. This summary MUST NOT be empty.
+2.  **List the most important financial metrics** as a list of strings, formatted as "Metric Name: Value".
+3.  **Consolidate all red flags** and inconsistencies into a single list of strings.
+4.  **Provide a final recommendation**: 'Approve', 'Deny', or 'Manual Review Required'.
+
 Here is all the data:
 ---
 {complete_data}
 ---
+
 Provide your response as a single, valid JSON object with four keys: "overall_summary", "key_financial_metrics", "consolidated_red_flags", and "final_recommendation".
 The final output must be ONLY the JSON object.
 """
@@ -99,7 +126,13 @@ async def process_single_file(file_content: bytes, filename: str) -> dict:
     if not images_to_process:
          raise HTTPException(status_code=400, detail="Could not convert document to image.")
 
-    content_parts = [{"type": "text", "text": unified_prompt}]
+    # 1. Classify
+    classification_message = HumanMessage(content=[{"type": "text", "text": classification_prompt_template}, {"type": "image_url", "image_url": pil_to_base64(images_to_process[0])}])
+    doc_type = llm.invoke([classification_message]).content.strip()
+
+    # 2. Extract
+    extraction_prompt = extraction_prompts.get(doc_type, extraction_prompts["Default"])
+    content_parts = [{"type": "text", "text": extraction_prompt}]
     for img in images_to_process:
         content_parts.append({"type": "image_url", "image_url": pil_to_base64(img)})
     
@@ -112,13 +145,16 @@ async def process_single_file(file_content: bytes, filename: str) -> dict:
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail=f"AI returned a non-JSON response: {response_json_string}")
 
+    # --- FIX: The document type from the AI might be different from our specific keys ---
+    # We should add the *actual* type returned by the classifier to the result
+    final_result['document_type'] = doc_type
     final_result['filename'] = filename
     return final_result
 
 @app.post("/process-application/")
 async def process_application(files: List[UploadFile] = File(...)):
     try:
-        application_id = str(uuid.uuid4()) # Generate a unique ID for this application batch
+        application_id = str(uuid.uuid4())
         application_results = []
         for file in files:
             file_content = await file.read()
@@ -127,7 +163,6 @@ async def process_application(files: List[UploadFile] = File(...)):
         
         summarized_data_for_ai = [{"filename": res.get('filename'), "document_type": res.get('document_type'), "data": res.get('extracted_data')} for res in application_results]
         
-        # --- RESTORED: Cross-Validation Step ---
         cross_val_message = HumanMessage(content=cross_validation_prompt.format(summarized_data=json.dumps(summarized_data_for_ai, indent=2)))
         cross_val_response_str = llm.invoke([cross_val_message]).content
         
@@ -137,7 +172,6 @@ async def process_application(files: List[UploadFile] = File(...)):
         except json.JSONDecodeError:
             cross_val_json = {"overall_summary": "AI cross-validation returned an invalid format.", "validation_passed": False}
 
-        # --- RESTORED: Final Summary Report Step ---
         complete_data_for_summary = { 
             "individual_documents": application_results,
             "initial_cross_validation": cross_val_json
@@ -195,8 +229,7 @@ async def save_verified_document(payload: VerificationPayload):
 @app.get("/get-report-data/")
 async def get_report_data():
     try:
-        # --- CHANGE: Fetch all documents to show history, not just active ones ---
-        cursor = verified_collection.find({})
+        cursor = verified_collection.find({"is_active": True})
         documents = await cursor.to_list(length=None)
         for doc in documents:
             doc["_id"] = str(doc["_id"])
